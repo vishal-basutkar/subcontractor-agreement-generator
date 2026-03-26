@@ -7,6 +7,7 @@ user-supplied values, and exports a PDF via LibreOffice.
 Returns: (pdf_bytes: bytes, filename: str)
 """
 
+import io
 import os
 import re
 import shutil
@@ -15,6 +16,8 @@ import tempfile
 import zipfile
 from datetime import datetime
 from pathlib import Path
+
+from pypdf import PdfWriter, PdfReader
 
 TEMPLATE = Path(__file__).parent.parent / "template" / "Subcontractor_Agreement_Template_clean.docx"
 EXPORTS  = Path(__file__).parent.parent / "exports"
@@ -61,36 +64,90 @@ _RUN_20 = '<w:r w:rsidRPr="00BE323A"><w:rPr><w:sz w:val="20"/><w:szCs w:val="20"
 def _populate_xml(xml: str, f: dict) -> str:
     """Apply all placeholder substitutions to document.xml content."""
 
-    # ── Simple one-to-one replacements ─────────────────────────────────────
-    simple = {
-        "[KHPXXX]":                  f["project_id"]        or "[KHPXXX]",
-        "[Address]":                 f["project_address"]    or "[Address]",
-        "[MM/DD/YYYY]":              _fmt_date(f["agreement_date"])   if f["agreement_date"]   else "[MM/DD/YYYY]",
-        "[Project Start Date]":      _fmt_date(f["start_date"])       if f["start_date"]       else "[Project Start Date]",
-        "[Project Completion Date]": _fmt_date(f["completion_date"])  if f["completion_date"]  else "[Project Completion Date]",
-        "[Subcontractor Name]":      f["subcontractor_name"] or "[Subcontractor Name]",
-        "[Company Name]":            f["company_name"]       or "[Company Name]",
-        "[Amount]":                  _fmt_amount(f["total_amount"])   if f["total_amount"]     else "[Amount]",
-        "[TITLE]":                   f["signatory_title"]    or "[TITLE]",
-        "[License #]":               f["license_number"]     or "[License #]",
-    }
-    for old, new in simple.items():
-        xml = xml.replace(old, new)
+    pid   = f["project_id"]         or "[KHPXXX]"
+    addr  = f["project_address"]     or "[Address]"
+    date  = _fmt_date(f["agreement_date"])  if f["agreement_date"]  else "[MM/DD/YYYY]"
+    sd    = _fmt_date(f["start_date"])      if f["start_date"]      else "[Project Start Date]"
+    cd    = _fmt_date(f["completion_date"]) if f["completion_date"] else "[Project Completion Date]"
+    sub   = f["subcontractor_name"]  or "[Subcontractor Name]"
+    co    = f["company_name"]         or "[Company Name]"
+    amt   = _fmt_amount(f["total_amount"])  if f["total_amount"]    else "[Amount]"
+    sname = f["signatory_name"]       or "[Name]"
+    title = f["signatory_title"]      or "[Title]"
+    seml  = f["signatory_email"]      or "[Email]"
+    beml  = f["sub_email"]            or "[Email]"
+    lic   = f["license_number"]       or "[License #]"
 
-    # ── [NAME] appears twice: 1st = KAEDIX signatory, 2nd = subcontractor ──
-    xml = _replace_nth(xml, "[NAME]", f["signatory_name"]    or "[NAME]", 1)
-    xml = _replace_nth(xml, "[NAME]", f["subcontractor_name"] or "[NAME]", 1)
+    # ── Simple single-run placeholders ─────────────────────────────────────
+    xml = xml.replace("[Address]",          addr)
+    xml = xml.replace("[MM/DD/YYYY]",       date)
+    xml = xml.replace("[Amount]",           amt)
+    xml = xml.replace("[Name]",             sname)
+    xml = xml.replace("[Subcontractor Name]", sub)
+    xml = xml.replace("[Email]",            beml)   # catches the simple (sub) occurrence
 
-    # ── [Email] appears twice: 1st = KAEDIX signatory, 2nd = subcontractor ─
-    xml = _replace_nth(xml, "[Email]", f["signatory_email"] or "[Email]", 1)
-    xml = _replace_nth(xml, "[Email]", f["sub_email"]       or "[Email]", 1)
+    # ── Split-run placeholders (exact raw XML replacement) ──────────────────
 
-    # ── Notes → Appendix A ──────────────────────────────────────────────────
-    if f["notes"]:
-        xml = xml.replace(
-            "<w:t>See attached pages.</w:t>",
-            f'<w:t xml:space="preserve">See attached pages.\n\nScope Summary: {f["notes"]}</w:t>',
-        )
+    # [KHPXXX] — split across 3 runs
+    xml = xml.replace(
+        '<w:r w:rsidR="00044E8D" w:rsidRPr="00044E8D"><w:t>[</w:t></w:r>'
+        '<w:r w:rsidRPr="00044E8D"><w:t>KHP</w:t></w:r>'
+        '<w:r w:rsidR="00044E8D" w:rsidRPr="00044E8D"><w:t>XXX]</w:t></w:r>',
+        f'<w:r><w:t>{pid}</w:t></w:r>',
+    )
+
+    # [Project Start Date] — split across 3 runs
+    xml = xml.replace(
+        '<w:r><w:t>[</w:t></w:r>'
+        '<w:r w:rsidR="00783D83"><w:t xml:space="preserve">Project </w:t></w:r>'
+        '<w:r><w:t>Start Date]</w:t></w:r>',
+        f'<w:r><w:t>{sd}</w:t></w:r>',
+    )
+
+    # [Project Completion Date] — split across 3 runs
+    xml = xml.replace(
+        '<w:r><w:t>[</w:t></w:r>'
+        '<w:r w:rsidR="00783D83"><w:t xml:space="preserve">Project </w:t></w:r>'
+        '<w:r><w:t>Completion Date]</w:t></w:r>',
+        f'<w:r><w:t>{cd}</w:t></w:r>',
+    )
+
+    # [Company Name] — split with bold runs
+    xml = xml.replace(
+        '<w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t>[</w:t></w:r>'
+        '<w:r w:rsidR="008E29CB"><w:rPr><w:b/><w:bCs/></w:rPr><w:t>Company</w:t></w:r>'
+        '<w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve"> Name]</w:t></w:r>',
+        f'<w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t>{co}</w:t></w:r>',
+    )
+
+    # [Title] — split across 3 runs
+    xml = xml.replace(
+        '<w:r w:rsidR="00B16321" w:rsidRPr="00F13F85"><w:t>[</w:t></w:r>'
+        '<w:r w:rsidRPr="00F13F85"><w:t>Title</w:t></w:r>'
+        '<w:r w:rsidR="00B16321" w:rsidRPr="00F13F85"><w:t>]</w:t></w:r>',
+        f'<w:r><w:t>{title}</w:t></w:r>',
+    )
+
+    # [Email] KAEDIX (signatory) — split across 3 runs
+    xml = xml.replace(
+        '<w:r w:rsidR="008777A2" w:rsidRPr="00F13F85"><w:t>[</w:t></w:r>'
+        '<w:r w:rsidRPr="00F13F85"><w:t>Email</w:t></w:r>'
+        '<w:r w:rsidR="008777A2" w:rsidRPr="00F13F85"><w:t>]</w:t></w:r>',
+        f'<w:r><w:t>{seml}</w:t></w:r>',
+    )
+
+    # [License #] — split with comment markup
+    xml = xml.replace(
+        '<w:r w:rsidRPr="00F13F85"><w:t>[</w:t></w:r>'
+        '<w:commentRangeStart w:id="5"/>'
+        '<w:r w:rsidRPr="00F13F85"><w:t>License #</w:t></w:r>'
+        '<w:commentRangeEnd w:id="5"/>'
+        '<w:r w:rsidRPr="00F13F85"><w:rPr><w:rStyle w:val="CommentReference"/>'
+        '<w:sz w:val="24"/><w:szCs w:val="24"/></w:rPr>'
+        '<w:commentReference w:id="5"/></w:r>'
+        '<w:r w:rsidRPr="00F13F85"><w:t>]</w:t></w:r>',
+        f'<w:r><w:t>{lic}</w:t></w:r>',
+    )
 
     return xml
 
@@ -113,7 +170,7 @@ def generate_agreement_pdf(
     signatory_name: str,
     signatory_title: str,
     signatory_email: str,
-    notes: str,
+    appendix_pdf_bytes: bytes = None,
 ) -> tuple[bytes, str]:
     """
     Populate the Word template and convert to PDF.
@@ -134,7 +191,6 @@ def generate_agreement_pdf(
         "signatory_name":    signatory_name.strip(),
         "signatory_title":   signatory_title.strip(),
         "signatory_email":   signatory_email.strip(),
-        "notes":             notes.strip(),
     }
 
     # Build output filename
@@ -198,6 +254,26 @@ def generate_agreement_pdf(
     soffice_out = EXPORTS / f"{stem}.pdf"
     if not soffice_out.exists():
         raise FileNotFoundError(f"Expected PDF not found: {soffice_out}")
+
+    # --- 3. Merge appendix PDF if provided ---------------------------------
+    if appendix_pdf_bytes:
+        writer = PdfWriter()
+
+        # Add all pages from the generated agreement
+        for page in PdfReader(soffice_out).pages:
+            writer.add_page(page)
+
+        # Add all pages from the uploaded appendix
+        for page in PdfReader(io.BytesIO(appendix_pdf_bytes)).pages:
+            writer.add_page(page)
+
+        merged_buf = io.BytesIO()
+        writer.write(merged_buf)
+        merged_bytes = merged_buf.getvalue()
+
+        # Overwrite the file on disk with the merged version
+        soffice_out.write_bytes(merged_bytes)
+        return merged_bytes, pdf_out.name
 
     pdf_bytes = soffice_out.read_bytes()
     return pdf_bytes, pdf_out.name

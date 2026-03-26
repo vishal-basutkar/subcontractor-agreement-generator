@@ -183,12 +183,11 @@ with st.form("agreement_form"):
 
     st.divider()
 
-    # ── Notes / Scope Summary ─────────────────────────────────────────────
-    st.markdown("#### Notes / Scope Summary")
-    notes = st.text_area(
-        "Brief scope description (for Appendix A)",
-        placeholder="Full scope details should be attached separately.",
-        height=120,
+    # ── Appendix A ────────────────────────────────────────────────────────
+    st.markdown("#### Appendix A")
+    appendix_pdf = st.file_uploader(
+        "Upload Appendix PDF (will be appended to the agreement)",
+        type=["pdf"],
     )
 
     submit = st.form_submit_button("Generate Agreement PDF", use_container_width=True)
@@ -202,6 +201,7 @@ if submit:
     else:
         with st.spinner("Generating PDF…"):
             try:
+                appendix_bytes = appendix_pdf.read() if appendix_pdf else None
                 pdf_bytes, filename = generate_agreement_pdf(
                     project_id=project_id,
                     project_address=project_address,
@@ -216,7 +216,7 @@ if submit:
                     signatory_name=signatory_name,
                     signatory_title=signatory_title,
                     signatory_email=signatory_email,
-                    notes=notes,
+                    appendix_pdf_bytes=appendix_bytes,
                 )
                 st.success("Agreement generated!")
                 st.download_button(
